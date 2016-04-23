@@ -18,6 +18,7 @@ module Database.PostgreSQL.Simple.Migration
     (
     -- * Migration actions
     runMigration
+    , revertMigration
 
     -- * Migration types
     , MigrationContext(..)
@@ -40,6 +41,7 @@ import           Control.Monad                      (void, when)
 import qualified Crypto.Hash.MD5                    as MD5 (hash)
 import qualified Data.ByteString                    as BS (ByteString, readFile)
 import qualified Data.ByteString.Base64             as B64 (encode)
+import qualified Data.ByteString.Char8              as BS8 (pack)
 import           Data.List                          (isPrefixOf, sort)
 #if __GLASGOW_HASKELL__ < 710
 import           Data.Monoid                        (mconcat)
@@ -74,6 +76,19 @@ runMigration (MigrationContext cmd verbose con) = case cmd of
         executeMigration con verbose name =<< BS.readFile path
     MigrationValidation validationCmd ->
         executeValidation con verbose validationCmd
+
+revertMigration :: MigrationCommand -> MigrationContext -> IO (MigrationResult String)
+revertMigration migration (MigrationContext cmd verbose con) = case cmd of
+    MigrationInitialization ->
+        return $ MigrationError "Schema initialization cannot be reverted"
+    MigrationDirectory _ ->
+       return $ MigrationError "Directory migrations cannot be reverted"
+    MigrationScript name contents ->
+        reverseMigration migration con verbose name contents
+    MigrationFile name path ->
+        reverseMigration migration con verbose name =<< BS.readFile path
+    MigrationValidation _ ->
+        return $ MigrationError "Validation not supported"
 
 -- | Executes all SQL-file based migrations located in the provided 'dir'
 -- in alphabetical order.
@@ -111,10 +126,45 @@ executeMigration con verbose name contents = do
             when verbose $ putStrLn $ "Execute:\t" ++ name
             return MigrationSuccess
         ScriptModified _ -> do
-            when verbose $ putStrLn $ "Fail:\t" ++ name
+            when verbose $ putStrLn $ "Fail:\t" ++ name ++ ", applied migration was modified"
             return (MigrationError name)
     where
         q = "insert into schema_migrations(filename, checksum) values(?, ?)"
+
+reverseMigration :: MigrationCommand -> Connection -> Bool -> ScriptName -> BS.ByteString -> IO (MigrationResult String)
+reverseMigration migration con verbose nameRevert contentsRevert = do
+    (nameApply, contentsApply) <- getNameAndContents migration
+    let checksum = md5Hash contentsApply
+    checkScript con nameApply checksum >>= \r -> case r of
+        ScriptOk -> revert
+        ScriptNotExecuted -> do
+            when verbose $ putStrLn $ "Fail:\t" ++ nameRevert ++ ", can only revert applied migrations"
+            return (MigrationError nameRevert)
+        ScriptModified _ -> do
+            when verbose $ putStrLn $ "Warning:\t" ++ nameRevert ++ ", applied migration was modified"
+            revert
+    where
+        q = "delete from schema_migrations where filename = ?"
+
+        getNameAndContents (MigrationScript name contents) = return (name, contents)
+        getNameAndContents (MigrationFile name path) = do
+            contents <- BS.readFile path
+            return (name, contents)
+        getNameAndContents _ = error "can only revert script/file migrations"
+
+        revert = do
+            migrations <- getMigrations con
+            case migrations of
+                [] -> return $ MigrationError "No applied migrations found"
+                _ -> do
+                    let lastMigration = last migrations
+                    if schemaMigrationName lastMigration == BS8.pack nameRevert
+                        then do
+                            void $ execute_ con (Query contentsRevert)
+                            void $ execute con q (Only nameRevert)
+                            when verbose $ putStrLn $ "Revert:\t\t" ++ nameRevert
+                            return MigrationSuccess
+                        else return $ MigrationError "Reverting migration must have same name"
 
 -- | Initializes the database schema with a helper table containing
 -- meta-information about executed migrations.
